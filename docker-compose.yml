@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3031:3031"
+    environment:
+      - ENVIRONMENT=production
+      - PROXY=${PROXY}
+      - REKA_TOKEN=${REKA_TOKEN}
+      - REKA_USER=${REKA_USER}
+      - REKA_PASS=${REKA_PASS}
