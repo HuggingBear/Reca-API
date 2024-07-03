@@ -69,3 +69,30 @@ def get_access_token(username, password, proxies=None):
         return None
 
     return access_token
+
+def parse_conversation_data(messages):
+    """
+    Parse OpenAI style conversation history into a Reka Playground style.
+
+    Args:
+        messages (list): OpenAI style conversation history.
+
+    Returns:
+        list: Reka Playground style conversation history.
+    """
+    parsed_messages = []
+    cached_user_message = ''
+
+    for m in messages:
+        if m['role'] == 'system' or m['role'] == 'user':
+            cached_user_message += f"{m['content']} "
+        elif m['role'] == 'assistant':
+            if cached_user_message:
+                parsed_messages.append({'type': 'human', 'text': cached_user_message.strip()})
+                cached_user_message = ''
+            parsed_messages.append({'type': 'model', 'text': m['content']})
+
+    if cached_user_message:
+        parsed_messages.append({'type': 'human', 'text': cached_user_message.strip()})
+
+    return parsed_messages

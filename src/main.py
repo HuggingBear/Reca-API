@@ -9,7 +9,7 @@ import logging
 from aiohttp import web
 
 from utils import get_logging_level, is_jwt_token_expired
-from reka import get_access_token
+from reka import get_access_token, parse_conversation_data
 
 logging.basicConfig(level=get_logging_level())
 logger = logging.getLogger(__name__)
@@ -42,14 +42,7 @@ async def handle_chat_request(request, access_token=None):
     model_name = body.get("model", "reka-core")
 
     # Convert request data to Reka Playground API format
-    conversation_history = []
-    for message in messages:
-        role = message.get("role")
-        content = message.get("content")
-        if role == "assistant":
-            conversation_history.append({"type": "model", "text": content})
-        else:
-            conversation_history.append({"type": "human", "text": content})
+    conversation_history = parse_conversation_data(messages)
 
     logger.debug(f"Conversation history: {conversation_history}")
 
