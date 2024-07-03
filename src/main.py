@@ -217,10 +217,34 @@ async def on_chat_completions_request(request):
 
     return await handle_chat_request(request)
 
+async def on_get_models_request(request):
+    available_models = [
+        "reka-core",
+        "reka-flash",
+        "reka-edge"
+    ]
+    
+    model_profiles = []
+    
+    for model in available_models:
+        model_data = {
+            "id": model,
+            "object": "model",
+            "created": 1719999999,
+            "owned_by": "reka-ai"
+        }
+        model_profiles.append(model_data)
+    
+    return web.json_response({
+        "object": "list",
+        "data": model_profiles
+    })
+
 
 app = web.Application()
 app.router.add_route("OPTIONS", "/{tail:.*}", on_cors_request)  # catch all OPTIONS requests
 app.router.add_route("POST", "/v1/chat/completions", on_chat_completions_request)
+app.router.add_route("GET", "/v1/models", on_get_models_request)
 
 if __name__ == '__main__':
     web.run_app(app, host='0.0.0.0', port=3031)
