@@ -208,7 +208,11 @@ async def on_chat_completions_request(request):
     access_token = header_token or memory_reka_access_token or env_reka_access_token
 
     # Get new token if no token was provided or cached or it was expired
-    if not access_token or is_jwt_token_expired(access_token):
+    if not access_token:
+        logger.warning("No access token provided, attempting to get a new one")
+        await update_access_token()
+    elif is_jwt_token_expired(access_token):
+        logger.warning("Access token has expired, attempting to get a new one")
         await update_access_token()
 
     return await handle_chat_request(request)
