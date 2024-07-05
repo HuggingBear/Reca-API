@@ -8,6 +8,7 @@ import re
 import logging
 from aiohttp import web
 
+from openai import create_reply_json, create_reply_json_chunk
 from utils import get_logging_level, is_jwt_token_expired
 from reka import get_access_token, parse_conversation_data
 
@@ -65,11 +66,11 @@ async def handle_chat_request(request, access_token=None):
     logger.debug(f"Sending request to Reka AI with headers: {headers}")
 
     try:
-        proxies = {}
-        if env_proxy:
-            proxies['https'] = env_proxy
+        proxies = {} if not env_proxy else {'https': env_proxy}
+        s = requests.Session()
+        s.proxies = proxies
 
-        response = requests.post(url, headers=headers, data=json.dumps(chat_data), stream=True)
+        response = s.post(url, headers=headers, data=json.dumps(chat_data), stream=stream)
         logger.debug(f"Response from Reka AI: {response.status_code}, {response.headers}")
     except Exception as e:
         logger.error(f"Unexpected error while requesting to Reka AI: {e}")
@@ -82,91 +83,94 @@ async def handle_chat_request(request, access_token=None):
         logger.error(f"Unexpected response from Reka AI: {response.status_code} - {response.text}")
         return web.Response(status=500, body="Unexpected response from upstream server")
 
-    response_stream = web.StreamResponse()
-    response_stream.headers['Content-Type'] = 'text/event-stream'
-    response_stream.headers['Access-Control-Allow-Origin'] = '*'
-    response_stream.headers['Access-Control-Allow-Methods'] = '*'
-    response_stream.headers['Access-Control-Allow-Headers'] = '*'
+    if stream:
+        response_stream = web.StreamResponse()
+        response_stream.headers['Content-Type'] = 'text/event-stream'
+        response_stream.headers['Access-Control-Allow-Origin'] = '*'
+        response_stream.headers['Access-Control-Allow-Methods'] = '*'
+        response_stream.headers['Access-Control-Allow-Headers'] = '*'
+
+        await response_stream.prepare(request)
+        writer = response_stream
+        # Reka Playground API will send chat completions from the first letter in every new stream message,
+        # so we need to keep track of the cursor location of the last message to avoid giving duplicate
+        # characters to the client.
+        previous_message_index = 0
+        finished = False
+
+        for line in response.iter_lines():
+            if finished:
+                return
+
+            logger.debug(f"Received response line: {line}")
+            # It might not be a stream response if the answer is too short?
+            if line and (line.startswith(b'data:') or line.startswith(b'{')):
+                decoded_line = line.decode('utf-8')
+                data_content = decoded_line[5:].strip() if decoded_line.startswith('data:') else decoded_line
+                data_json = None
+
+                try:
+                    data_json = json.loads(data_content)
+                except Exception as e:
+                    logger.error(f"Unable to decode response message: {data_content}")
+                    return web.Response(status=500, body="Unable to decode upstream response")
+
+                if data_json.get('type') == 'model':
+                    metadata = data_json.get('metadata', {})
+                    full_text = data_json.get('text', '')
+                    full_text_length = len(full_text)
+                    sep_matches = re.search(r'\n <s?e?p?$', full_text)
+                    text_ends_location = full_text_length if not sep_matches else sep_matches.start()
+
+                    openai_chunk = create_reply_json_chunk(
+                        model_name,
+                        full_text[previous_message_index:text_ends_location],
+                        metadata.get('input_tokens', 0),
+                        metadata.get('generated_tokens', 0),
+                        data_json.get('finish_reason')
+                    )
+
+                    previous_message_index = len(full_text)
+
+                    event_data = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                    await writer.write(event_data.encode('utf-8'))
+                    logger.debug(f"Wrote event data: {event_data}")
+
+                    if 'finish_reason' in data_json:
+                        await writer.write("data: [DONE]\n\n".encode('utf-8'))
+                        await writer.write_eof()
+                        finished = True
+                        logger.debug("Wrote [DONE]")
+            elif line.startswith(b'event: message'):
+                pass
+            elif not line:
+                pass
+            else:
+                logger.info(f"Unknown data line in Reka AI response: {line}")
+                pass
+
+        return writer
+    else:
+        try:
+            data_json = response.json()
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode JSON from Reka AI response: {response.text}")
+            return web.Response(status=500, text="Unable to decode JSON from Reka AI response.")
+
+        metadata = data_json.get('metadata', {})
+        input_tokens = metadata.get('input_tokens', 0)
+        generated_tokens = metadata.get('generated_tokens', 0)
+
+        openai_json = create_reply_json(
+            model_name,
+            data_json.get('text', ''),
+            input_tokens,
+            generated_tokens,
+            data_json.get('finish_reason', '')
+        )
+
+        return web.Response(status=200, text=json.dumps(openai_json))
     
-    await response_stream.prepare(request)
-    writer = response_stream
-    # Reka Playground API will send chat completions from the first letter in every new stream message,
-    # so we need to keep track of the cursor location of the last message to avoid giving duplicate
-    # characters to the client.
-    previous_message_index = 0
-    finished = False
-    
-    
-    for line in response.iter_lines():
-        if finished:
-            return
-        
-        logger.debug(f"Received response line: {line}")
-
-        # It might not be a stream response if the answer is too short?
-        if line and (line.startswith(b'data:') or line.startswith(b'{')):
-            decoded_line = line.decode('utf-8')
-            data_content = decoded_line[5:].strip() if decoded_line.startswith('data:') else decoded_line
-            data_json = None
-
-            try:
-                data_json = json.loads(data_content)
-            except Exception as e:
-                logger.error(f"Unable to decode response message: {data_content}")
-                return web.Response(status=500, body="Unable to decode upstream response")
-            
-            # Filter model response and convert to OpenAI style data structure
-            if data_json['type'] == 'model':
-                full_text = data_json['text']
-                full_text_length = len(full_text)
-                # I don't know why there are <sep in the end of chat response, truncate it
-                sep_matches = re.search(r'\n <s?e?p?$', full_text)
-                text_ends_location = full_text_length if not sep_matches else sep_matches.start()
-                
-                
-                new_json = {
-                    "id": "chatcmpl-reka-ai",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": full_text[previous_message_index:text_ends_location]
-                            },
-                            "finish_reason": "stop" if "finish_reason" in data_json else None,
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": data_json['metadata']['input_tokens'],
-                        "completion_tokens": data_json['metadata']['generated_tokens'],
-                        "total_tokens": data_json['metadata']['input_tokens'] + data_json['metadata']['generated_tokens']
-                    },
-                }
-                
-                previous_message_index = len(full_text)
-
-                event_data = f"data: {json.dumps(new_json, ensure_ascii=False)}\n\n"
-                await writer.write(event_data.encode('utf-8'))
-                logger.debug(f"Wrote event data: {event_data}")
-                
-                if "finish_reason" in data_json:
-                    await writer.write("data: [DONE]\n\n".encode('utf-8'))
-                    await writer.write_eof()
-                    finished = True
-                    logger.debug("Wrote [DONE]")
-            # It doesn't seem useful
-        elif line.startswith(b'event: message'):
-            pass
-        elif not line:
-            pass
-        else:
-            logger.info(f"Unknown data line in Reka AI response: {line}")
-            pass
-
-    return writer
 
 
 async def update_access_token():
@@ -185,9 +189,7 @@ async def update_access_token():
         raise ValueError("No access token was provided, nor a username and password.")
 
     create_token_event.clear()
-    proxies = {}
-    if env_proxy:
-        proxies = {"https": env_proxy}
+    proxies = {} if not env_proxy else {'https': env_proxy}
     memory_reka_access_token = get_access_token(env_reka_user, env_reka_pass, proxies)
     create_token_event.set()
 
